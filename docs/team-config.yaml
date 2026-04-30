@@ -1,0 +1,34 @@
+# CLIProxyAPI team config
+# Creator: sunyan
+# Copy to config.yaml before running and replace placeholders.
+
+host: 127.0.0.1
+port: 8317
+auth-dir: ~/.cli-proxy-api/auths
+request-retry: 3
+allow-remote: true
+request-log: false
+
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+
+api-keys:
+  - sk-dummy
+
+remote-management:
+  secret-key: ""
+
+openai-compatibility:
+  - name: openclaudecode
+    base-url: https://YOUR_OPENCLAUDECODE_BASE_URL/v1
+    api-key-entries:
+      - api-key: YOUR_OPENCLAUDECODE_API_KEY
+    models:
+      - name: gpt-5.5
+        alias: claude-opus-4-7
+        thinking:
+          levels:
+            - medium
+            - high
+            - xhigh

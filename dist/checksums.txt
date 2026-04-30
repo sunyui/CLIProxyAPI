@@ -1,0 +1,4 @@
+cfeca0d62bda6a0b5a92d81f208b1034410bb7c4b57be36ed94e68304b941279  cli-proxy-api_team-dist_darwin_amd64.tar.gz
+fc46c994e2a96f4dcf5064edf114452b4b54adc9896bdb30dc528f9a8983dd4a  cli-proxy-api_team-dist_darwin_arm64.tar.gz
+094efbbf8c8835dc0fa9dce50cc176aed6837d042653420ab7cab7eee43ca777  cli-proxy-api_team-dist_linux_amd64.tar.gz
+1e570b4cb01997842f0464354fbe828f97da489d5263476387dfbfe94ec89180  cli-proxy-api_team-dist_windows_amd64.zip
