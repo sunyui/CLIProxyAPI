@@ -129,6 +129,24 @@ func effectiveOpenAIFinishReason(param *ConvertOpenAIResponseToAnthropicParams) 
 	return param.FinishReason
 }
 
+func sanitizeReadToolInputPages(toolName, argsJSON string) string {
+	if util.CanonicalToolName(toolName) != "read" || argsJSON == "" || !strings.Contains(argsJSON, "\"pages\"") || !gjson.Valid(argsJSON) {
+		return argsJSON
+	}
+	pages := gjson.Get(argsJSON, "pages")
+	if !pages.Exists() {
+		return argsJSON
+	}
+	if pages.Type != gjson.Null && (pages.Type != gjson.String || pages.String() != "") {
+		return argsJSON
+	}
+	cleaned, err := sjson.Delete(argsJSON, "pages")
+	if err != nil {
+		return argsJSON
+	}
+	return cleaned
+}
+
 // convertOpenAIStreamingChunkToAnthropic converts OpenAI streaming chunk to Anthropic streaming events
 func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAIResponseToAnthropicParams) [][]byte {
 	root := gjson.ParseBytes(rawJSON)
@@ -302,7 +320,8 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				if accumulator.Arguments.Len() > 0 {
 					inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
 					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
+					argsJSON := sanitizeReadToolInputPages(accumulator.Name, util.FixJSON(accumulator.Arguments.String()))
+					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", argsJSON)
 					results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
 				}
 
@@ -368,7 +387,8 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 			if accumulator.Arguments.Len() > 0 {
 				inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
 				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
+				argsJSON := sanitizeReadToolInputPages(accumulator.Name, util.FixJSON(accumulator.Arguments.String()))
+				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", argsJSON)
 				results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
 			}
 
@@ -425,11 +445,12 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 		// Handle tool calls
 		if toolCalls := choice.Get("message.tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
 			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
+				toolName := toolCall.Get("function.name").String()
 				toolUseBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
 				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
-				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolCall.Get("function.name").String())
+				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolName)
 
-				argsStr := util.FixJSON(toolCall.Get("function.arguments").String())
+				argsStr := sanitizeReadToolInputPages(toolName, util.FixJSON(toolCall.Get("function.arguments").String()))
 				if argsStr != "" && gjson.Valid(argsStr) {
 					argsJSON := gjson.Parse(argsStr)
 					if argsJSON.IsObject() {
@@ -623,11 +644,12 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 							if toolCalls.IsArray() {
 								toolCalls.ForEach(func(_, tc gjson.Result) bool {
 									hasToolCall = true
+									toolName := util.MapToolName(toolNameMap, tc.Get("function.name").String())
 									toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
 									toolUse, _ = sjson.SetBytes(toolUse, "id", util.SanitizeClaudeToolID(tc.Get("id").String()))
-									toolUse, _ = sjson.SetBytes(toolUse, "name", util.MapToolName(toolNameMap, tc.Get("function.name").String()))
+									toolUse, _ = sjson.SetBytes(toolUse, "name", toolName)
 
-									argsStr := util.FixJSON(tc.Get("function.arguments").String())
+									argsStr := sanitizeReadToolInputPages(toolName, util.FixJSON(tc.Get("function.arguments").String()))
 									if argsStr != "" && gjson.Valid(argsStr) {
 										argsJSON := gjson.Parse(argsStr)
 										if argsJSON.IsObject() {
@@ -680,11 +702,12 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 			if toolCalls := message.Get("tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
 				toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 					hasToolCall = true
+					toolName := util.MapToolName(toolNameMap, toolCall.Get("function.name").String())
 					toolUseBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
 					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
-					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", util.MapToolName(toolNameMap, toolCall.Get("function.name").String()))
+					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolName)
 
-					argsStr := util.FixJSON(toolCall.Get("function.arguments").String())
+					argsStr := sanitizeReadToolInputPages(toolName, util.FixJSON(toolCall.Get("function.arguments").String()))
 					if argsStr != "" && gjson.Valid(argsStr) {
 						argsJSON := gjson.Parse(argsStr)
 						if argsJSON.IsObject() {

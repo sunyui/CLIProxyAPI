@@ -275,38 +275,80 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		readStart := time.Now()
 		for scanner.Scan() {
+			readWait := time.Since(readStart)
 			line := scanner.Bytes()
+			if readWait > 5*time.Second {
+				helps.LogWithRequestID(ctx).Infof("openai compat stream slow upstream read: wait=%s bytes=%d", readWait.Round(time.Millisecond), len(line))
+			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 			}
-			if len(line) == 0 {
+			streamLine := trimOpenAICompatStreamLine(line)
+			if len(streamLine) == 0 {
+				readStart = time.Now()
 				continue
 			}
 
-			if !bytes.HasPrefix(line, []byte("data:")) {
+			if !bytes.HasPrefix(streamLine, []byte("data:")) {
+				if isOpenAICompatSSEMetadataLine(streamLine) {
+					readStart = time.Now()
+					continue
+				}
+				if isOpenAICompatJSONErrorLine(streamLine) {
+					streamErr := statusErr{code: http.StatusBadGateway, msg: string(streamLine)}
+					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.PublishFailure(ctx)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+					case <-ctx.Done():
+					}
+					return
+				}
+				readStart = time.Now()
 				continue
 			}
 
-			// OpenAI-compatible streams are SSE: lines typically prefixed with "data: ".
-			// Pass through translator; it yields one or more chunks for the target schema.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(line), &param)
+			translateStart := time.Now()
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(streamLine), &param)
+			translateElapsed := time.Since(translateStart)
+			if translateElapsed > 100*time.Millisecond {
+				helps.LogWithRequestID(ctx).Infof("openai compat stream slow translate: elapsed=%s input_bytes=%d output_chunks=%d", translateElapsed.Round(time.Millisecond), len(streamLine), len(chunks))
+			}
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+				sendStart := time.Now()
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case <-ctx.Done():
+					return
+				}
+				sendElapsed := time.Since(sendStart)
+				if sendElapsed > 100*time.Millisecond {
+					helps.LogWithRequestID(ctx).Infof("openai compat stream slow executor send: elapsed=%s payload_bytes=%d", sendElapsed.Round(time.Millisecond), len(chunks[i]))
+				}
 			}
+			readStart = time.Now()
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case <-ctx.Done():
+			}
 		} else {
 			// In case the upstream close the stream without a terminal [DONE] marker.
 			// Feed a synthetic done marker through the translator so pending
 			// response.completed events are still emitted exactly once.
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 		// Ensure we record the request if no usage chunk was ever seen
@@ -390,6 +432,18 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *con
 		}
 	}
 	return nil
+}
+
+func trimOpenAICompatStreamLine(line []byte) []byte {
+	return bytes.TrimLeft(line, " \t\r\n")
+}
+
+func isOpenAICompatSSEMetadataLine(line []byte) bool {
+	return bytes.HasPrefix(line, []byte(":")) || bytes.HasPrefix(line, []byte("event:")) || bytes.HasPrefix(line, []byte("id:")) || bytes.HasPrefix(line, []byte("retry:"))
+}
+
+func isOpenAICompatJSONErrorLine(line []byte) bool {
+	return bytes.HasPrefix(line, []byte("{")) || bytes.HasPrefix(line, []byte("["))
 }
 
 func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byte {

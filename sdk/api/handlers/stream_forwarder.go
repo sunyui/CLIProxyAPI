@@ -1,12 +1,23 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	log "github.com/sirupsen/logrus"
 )
+
+func logStreamSlow(ctx context.Context, stage string, elapsed time.Duration, bytes int) {
+	entry := log.StandardLogger().WithField("stage", stage)
+	if requestID := logging.GetRequestID(ctx); requestID != "" {
+		entry = entry.WithField("request_id", requestID)
+	}
+	entry.Infof("stream slow path: elapsed=%s bytes=%d", elapsed.Round(time.Millisecond), bytes)
+}
 
 type StreamForwardOptions struct {
 	// KeepAliveInterval overrides the configured streaming keep-alive interval.
@@ -94,8 +105,18 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				cancel(nil)
 				return
 			}
+			writeStart := time.Now()
 			writeChunk(chunk)
+			writeElapsed := time.Since(writeStart)
+			if writeElapsed > 100*time.Millisecond {
+				logStreamSlow(c.Request.Context(), "client write", writeElapsed, len(chunk))
+			}
+			flushStart := time.Now()
 			flusher.Flush()
+			flushElapsed := time.Since(flushStart)
+			if flushElapsed > 100*time.Millisecond {
+				logStreamSlow(c.Request.Context(), "client flush", flushElapsed, len(chunk))
+			}
 		case errMsg, ok := <-errs:
 			if !ok {
 				continue

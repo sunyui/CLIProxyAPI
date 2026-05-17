@@ -686,6 +686,13 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		}
 
 		sendData := func(chunk []byte) bool {
+			sendStart := time.Now()
+			defer func() {
+				elapsed := time.Since(sendStart)
+				if elapsed > 100*time.Millisecond {
+					logStreamSlow(ctx, "handler send", elapsed, len(chunk))
+				}
+			}()
 			if ctx == nil {
 				dataChan <- chunk
 				return true
