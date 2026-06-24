@@ -1,208 +1,407 @@
 package claude
 
 import (
+	"bytes"
 	"context"
-	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
 
-func TestConvertOpenAIResponseToClaude_StreamToolCallIgnoresEmptyNameDeltas(t *testing.T) {
-	events := convertOpenAIStreamTestEvents(t, []string{
-		`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":""}}]},"finish_reason":null}]}`,
-		`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\""}}]},"finish_reason":null}]}`,
-		`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"command"}}]},"finish_reason":null}]}`,
-		`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"\":\"pwd\"}"}}]},"finish_reason":null}]}`,
-		`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
-		`data: [DONE]`,
-	})
-
-	assertSingleBashToolUse(t, events)
-	assertToolArgsAndStopReason(t, events)
+type sseEvent struct {
+	Type    string
+	Payload string
 }
 
-func TestConvertOpenAIResponseToClaude_StreamToolCallSuppressesRepeatedNameStart(t *testing.T) {
-	events := convertOpenAIStreamTestEvents(t, []string{
-		`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":""}}]},"finish_reason":null}]}`,
-		`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"Bash","arguments":"{\"command\":\"pwd\"}"}}]},"finish_reason":null}]}`,
-		`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
-		`data: [DONE]`,
-	})
-
-	assertSingleBashToolUse(t, events)
-	assertToolArgsAndStopReason(t, events)
-}
-
-func TestConvertOpenAIResponseToClaude_StreamReadToolCallSanitizesPages(t *testing.T) {
-	testCases := []struct {
-		name        string
-		arguments   string
-		wantPages   string
-		pagesExists bool
-	}{
-		{
-			name:      "drops empty pages",
-			arguments: `{"file_path":"/tmp/example.txt","pages":""}`,
-		},
-		{
-			name:      "drops null pages",
-			arguments: `{"file_path":"/tmp/example.txt","pages":null}`,
-		},
-		{
-			name:        "preserves non-empty pages",
-			arguments:   `{"file_path":"/tmp/example.pdf","pages":"1-2"}`,
-			wantPages:   "1-2",
-			pagesExists: true,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			escapedArgs := strconv.Quote(tc.arguments)
-			events := convertOpenAIStreamTestEventsForRequest(t, []byte(`{"stream":true,"tools":[{"name":"Read"}]}`), []string{
-				`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Read","arguments":` + escapedArgs + `}}]},"finish_reason":null}]}`,
-				`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,"model":"gpt-test","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
-				`data: [DONE]`,
-			})
-
-			args := collectToolInputJSON(t, events)
-			parsed := gjson.Parse(args)
-			if got := parsed.Get("file_path").String(); got == "" {
-				t.Fatalf("file_path missing from tool arguments: %s", args)
-			}
-			pages := parsed.Get("pages")
-			if pages.Exists() != tc.pagesExists {
-				t.Fatalf("pages exists = %v, want %v; args=%s", pages.Exists(), tc.pagesExists, args)
-			}
-			if tc.pagesExists && pages.String() != tc.wantPages {
-				t.Fatalf("pages = %q, want %q; args=%s", pages.String(), tc.wantPages, args)
-			}
-		})
-	}
-}
-
-func TestConvertOpenAIResponseToClaudeNonStream_ReadToolCallSanitizesPages(t *testing.T) {
-	testCases := []struct {
-		name string
-		raw  []byte
-	}{
-		{
-			name: "drops empty pages",
-			raw:  []byte(`{"id":"chatcmpl-test","model":"gpt-test","choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"/tmp/example.txt\",\"pages\":\"\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`),
-		},
-		{
-			name: "drops null pages",
-			raw:  []byte(`{"id":"chatcmpl-test","model":"gpt-test","choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"/tmp/example.txt\",\"pages\":null}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`),
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			out := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "gpt-test", []byte(`{"tools":[{"name":"Read"}]}`), nil, tc.raw, nil)
-			input := gjson.GetBytes(out, "content.0.input")
-			if got := input.Get("file_path").String(); got == "" {
-				t.Fatalf("file_path missing from tool input: %s", string(out))
-			}
-			if pages := input.Get("pages"); pages.Exists() {
-				t.Fatalf("pages exists = true, want false; output=%s", string(out))
-			}
-		})
-	}
-}
-
-func convertOpenAIStreamTestEvents(t *testing.T, chunks []string) []gjson.Result {
+func runStream(t *testing.T, originalReq string, chunks ...string) []sseEvent {
 	t.Helper()
 
-	return convertOpenAIStreamTestEventsForRequest(t, []byte(`{"stream":true,"tools":[{"name":"Bash"}]}`), chunks)
-}
-
-func convertOpenAIStreamTestEventsForRequest(t *testing.T, originalRequest []byte, chunks []string) []gjson.Result {
-	t.Helper()
-
-	var param any
-	var events []gjson.Result
-
+	var paramAny any
+	var emitted [][]byte
 	for _, chunk := range chunks {
-		out := ConvertOpenAIResponseToClaude(context.Background(), "gpt-test", originalRequest, nil, []byte(chunk), &param)
-		for _, raw := range out {
-			event := parseSSEDataJSON(t, string(raw))
-			events = append(events, event)
-		}
+		emitted = append(emitted, ConvertOpenAIResponseToClaude(
+			context.Background(),
+			"",
+			[]byte(originalReq),
+			nil,
+			[]byte("data: "+chunk),
+			&paramAny,
+		)...)
 	}
+	emitted = append(emitted, ConvertOpenAIResponseToClaude(
+		context.Background(),
+		"",
+		[]byte(originalReq),
+		nil,
+		[]byte("data: [DONE]"),
+		&paramAny,
+	)...)
 
+	var events []sseEvent
+	for _, raw := range emitted {
+		s := string(raw)
+		if !strings.HasPrefix(s, "event: ") {
+			continue
+		}
+		nl := strings.Index(s, "\n")
+		if nl < 0 {
+			continue
+		}
+		typ := strings.TrimPrefix(s[:nl], "event: ")
+		rest := s[nl+1:]
+		if !strings.HasPrefix(rest, "data: ") {
+			continue
+		}
+		payload := strings.TrimRight(strings.TrimPrefix(rest, "data: "), "\n")
+		events = append(events, sseEvent{Type: typ, Payload: payload})
+	}
 	return events
 }
 
-func parseSSEDataJSON(t *testing.T, raw string) gjson.Result {
-	t.Helper()
+func countByType(events []sseEvent, typ string) int {
+	n := 0
+	for _, e := range events {
+		if e.Type == typ {
+			n++
+		}
+	}
+	return n
+}
 
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
+func toolUseStarts(events []sseEvent) []sseEvent {
+	var out []sseEvent
+	for _, e := range events {
+		if e.Type != "content_block_start" {
 			continue
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		parsed := gjson.Parse(payload)
-		if !parsed.Exists() {
-			t.Fatalf("invalid SSE JSON payload: %q", payload)
+		if gjson.Get(e.Payload, "content_block.type").String() == "tool_use" {
+			out = append(out, e)
 		}
-		return parsed
 	}
-
-	t.Fatalf("missing SSE data line: %q", raw)
-	return gjson.Result{}
+	return out
 }
 
-func assertSingleBashToolUse(t *testing.T, events []gjson.Result) {
-	t.Helper()
-
-	var toolStarts []gjson.Result
-	for _, event := range events {
-		if event.Get("type").String() == "content_block_start" && event.Get("content_block.type").String() == "tool_use" {
-			toolStarts = append(toolStarts, event)
+func blockIndices(events []sseEvent) []int64 {
+	var idx []int64
+	for _, e := range events {
+		if e.Type == "content_block_start" {
+			idx = append(idx, gjson.Get(e.Payload, "index").Int())
 		}
 	}
+	return idx
+}
 
-	if len(toolStarts) != 1 {
-		t.Fatalf("tool_use content_block_start count = %d, want 1; starts=%v", len(toolStarts), toolStarts)
+func lastStopReason(events []sseEvent) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == "message_delta" {
+			return gjson.Get(events[i].Payload, "delta.stop_reason").String()
+		}
 	}
-	if got := toolStarts[0].Get("content_block.name").String(); got != "Bash" {
-		t.Fatalf("tool name = %q, want Bash", got)
+	return ""
+}
+
+const streamReq = `{"stream":true}`
+
+func TestConvertOpenAIResponseToClaude_StreamReadToolCallSanitizesPages(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_read","function":{"name":"Read","arguments":""}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"file_path\":\"/tmp/a.txt\",\"pages\":\"1\"}"}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+	)
+	for _, event := range events {
+		if event.Type == "content_block_delta" && strings.Contains(event.Payload, "pages") {
+			t.Fatalf("expected pages to be removed for non-PDF Read input, got %s", event.Payload)
+		}
 	}
 }
 
-func collectToolInputJSON(t *testing.T, events []gjson.Result) string {
-	t.Helper()
-
-	var gotArgs string
+func TestConvertOpenAIResponseToClaude_StreamReadToolCallKeepsPDFPages(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_read","function":{"name":"Read","arguments":""}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"file_path\":\"/tmp/a.pdf\",\"pages\":\"1\"}"}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+	)
+	foundPages := false
 	for _, event := range events {
-		if event.Get("type").String() == "content_block_delta" && event.Get("delta.type").String() == "input_json_delta" {
-			gotArgs += event.Get("delta.partial_json").String()
+		if event.Type == "content_block_delta" && strings.Contains(event.Payload, "pages") {
+			foundPages = true
 		}
 	}
-	if gotArgs == "" {
-		t.Fatalf("missing input_json_delta in events: %v", events)
+	if !foundPages {
+		t.Fatal("expected pages to be preserved for PDF Read input")
 	}
-	return gotArgs
 }
 
-func assertToolArgsAndStopReason(t *testing.T, events []gjson.Result) {
-	t.Helper()
+func TestConvertOpenAIResponseToClaudeNonStream_EnterWorktreeDropsEmptyNameWithPath(t *testing.T) {
+	out := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "", []byte(streamReq), nil, []byte(`{"id":"chatcmpl","model":"m","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"EnterWorktree","arguments":"{\"path\":\"/tmp/work\",\"name\":\"\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`), nil)
+	input := gjson.GetBytes(out, "content.0.input")
+	if !input.Get("path").Exists() {
+		t.Fatalf("expected path to remain, got %s", input.Raw)
+	}
+	if input.Get("name").Exists() {
+		t.Fatalf("expected empty name to be removed, got %s", input.Raw)
+	}
+}
 
-	gotArgs := collectToolInputJSON(t, events)
-	var gotStopReason string
-	for _, event := range events {
-		if event.Get("type").String() == "message_delta" {
-			gotStopReason = event.Get("delta.stop_reason").String()
+func TestConvertOpenAIResponseToClaude_StreamIgnoresNullToolNameDelta(t *testing.T) {
+	originalRequest := []byte(streamReq)
+	var param any
+
+	firstChunks := ConvertOpenAIResponseToClaude(
+		context.Background(),
+		"test-model",
+		originalRequest,
+		nil,
+		[]byte(`data: {"id":"chatcmpl_1","model":"test-model","created":1,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}]}`),
+		&param,
+	)
+	firstOutput := bytes.Join(firstChunks, nil)
+	if !bytes.Contains(firstOutput, []byte(`"name":"read_file"`)) {
+		t.Fatalf("expected first chunk to start read_file tool block, got %s", string(firstOutput))
+	}
+
+	secondChunks := ConvertOpenAIResponseToClaude(
+		context.Background(),
+		"test-model",
+		originalRequest,
+		nil,
+		[]byte(`data: {"id":"chatcmpl_1","model":"test-model","created":1,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":null,"arguments":"{\"path\":\"/tmp/a\"}"}}]},"finish_reason":null}]}`),
+		&param,
+	)
+	secondOutput := bytes.Join(secondChunks, nil)
+	if bytes.Contains(secondOutput, []byte(`content_block_start`)) {
+		t.Fatalf("did not expect null tool name delta to start a new content block, got %s", string(secondOutput))
+	}
+	if bytes.Contains(secondOutput, []byte(`"name":""`)) {
+		t.Fatalf("did not expect null tool name delta to emit an empty tool name, got %s", string(secondOutput))
+	}
+}
+
+func TestStreamingTool_EmptyNameThroughout(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","function":{"name":"","arguments":""}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\"x\":1}"}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+
+	if got := len(toolUseStarts(events)); got != 0 {
+		t.Fatalf("expected zero tool_use content_block_start, got %d (events=%+v)", got, events)
+	}
+	if got := countByType(events, "content_block_delta"); got != 0 {
+		t.Fatalf("expected zero content_block_delta when start was suppressed, got %d", got)
+	}
+	if got := countByType(events, "content_block_stop"); got != 0 {
+		t.Fatalf("expected zero content_block_stop when start was suppressed, got %d", got)
+	}
+	if got := lastStopReason(events); got == "tool_use" {
+		t.Fatalf("stop_reason must not be tool_use when zero tool_use blocks were emitted; got %q", got)
+	}
+}
+
+func TestStreamingTool_NullName(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","function":{"name":null,"arguments":""}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+	if got := len(toolUseStarts(events)); got != 0 {
+		t.Fatalf("null name must not produce a tool_use start; got %d", got)
+	}
+	if got := countByType(events, "content_block_stop"); got != 0 {
+		t.Fatalf("null name must not produce content_block_stop; got %d", got)
+	}
+}
+
+func TestStreamingTool_NonStringName(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","function":{"name":123,"arguments":""}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+	if got := len(toolUseStarts(events)); got != 0 {
+		t.Fatalf("non-string name must not produce a tool_use start; got %d", got)
+	}
+}
+
+func TestStreamingTool_RepeatedName(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","function":{"name":"do_it","arguments":""}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"do_it","arguments":"{\"x\""}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"do_it","arguments":":1}"}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+
+	starts := toolUseStarts(events)
+	if len(starts) != 1 {
+		t.Fatalf("expected exactly one tool_use start, got %d", len(starts))
+	}
+	if name := gjson.Get(starts[0].Payload, "content_block.name").String(); name != "do_it" {
+		t.Fatalf("announced tool name = %q, want %q", name, "do_it")
+	}
+	if got := countByType(events, "content_block_stop"); got != 1 {
+		t.Fatalf("expected exactly one content_block_stop, got %d", got)
+	}
+}
+
+func TestStreamingTool_MixedSuppressedAndValid(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+			{"index":0,"id":"call_skip","function":{"name":"","arguments":""}},
+			{"index":1,"id":"call_real","function":{"name":"do_it","arguments":""}}
+		]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[
+			{"index":1,"function":{"arguments":"{}"}}
+		]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+
+	starts := toolUseStarts(events)
+	if len(starts) != 1 {
+		t.Fatalf("expected exactly one tool_use start, got %d", len(starts))
+	}
+	if got := countByType(events, "content_block_stop"); got != 1 {
+		t.Fatalf("expected exactly one content_block_stop, got %d", got)
+	}
+
+	indices := blockIndices(events)
+	if len(indices) == 0 || indices[0] != 0 {
+		t.Fatalf("first content_block_start index must be 0, got %v", indices)
+	}
+}
+
+func TestStreamingTool_EmptyIDDeferStart(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"","function":{"name":"do_it","arguments":""}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_real","function":{"arguments":"{}"}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+
+	starts := toolUseStarts(events)
+	if len(starts) != 1 {
+		t.Fatalf("expected exactly one tool_use start once id arrived, got %d", len(starts))
+	}
+	if id := gjson.Get(starts[0].Payload, "content_block.id").String(); id != "call_real" {
+		t.Fatalf("announced tool id = %q, want %q", id, "call_real")
+	}
+}
+
+func TestStreamingTool_IDInDeltaWithoutFunction(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"name":"do_it"}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_real"}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+
+	starts := toolUseStarts(events)
+	if len(starts) != 1 {
+		t.Fatalf("expected exactly one tool_use start when id arrives in a function-less delta, got %d", len(starts))
+	}
+	if id := gjson.Get(starts[0].Payload, "content_block.id").String(); id != "call_real" {
+		t.Fatalf("announced tool id = %q, want %q", id, "call_real")
+	}
+	if name := gjson.Get(starts[0].Payload, "content_block.name").String(); name != "do_it" {
+		t.Fatalf("announced tool name = %q, want %q", name, "do_it")
+	}
+	if got := countByType(events, "content_block_stop"); got != 1 {
+		t.Fatalf("expected exactly one content_block_stop, got %d", got)
+	}
+}
+
+func TestStreamingTool_StopReasonWithEmittedTool(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","function":{"name":"do_it","arguments":"{}"}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+	)
+	if got := lastStopReason(events); got != "tool_use" {
+		t.Fatalf("stop_reason = %q, want %q", got, "tool_use")
+	}
+}
+
+func TestStreamingTool_StopReasonWhenIDNeverArrives(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"name":"do_it","arguments":""}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+
+	starts := toolUseStarts(events)
+	if len(starts) != 1 {
+		t.Fatalf("expected one belated tool_use start with synthetic id, got %d", len(starts))
+	}
+	id := gjson.Get(starts[0].Payload, "content_block.id").String()
+	if !strings.HasPrefix(id, "toolu_") {
+		t.Fatalf("synthetic id should match toolu_<nanos>_<n>, got %q", id)
+	}
+	if name := gjson.Get(starts[0].Payload, "content_block.name").String(); name != "do_it" {
+		t.Fatalf("announced tool name = %q, want %q", name, "do_it")
+	}
+	if got := lastStopReason(events); got != "tool_use" {
+		t.Fatalf("stop_reason = %q, want %q", got, "tool_use")
+	}
+}
+
+func TestStreamingTool_BelatedStartsUseOpenAIToolIndexOrder(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+			{"index":2,"function":{"name":"third_tool","arguments":"{}"}},
+			{"index":0,"function":{"name":"first_tool","arguments":"{}"}},
+			{"index":1,"function":{"name":"second_tool","arguments":"{}"}}
+		]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+
+	starts := toolUseStarts(events)
+	if len(starts) != 3 {
+		t.Fatalf("expected three belated tool_use starts, got %d", len(starts))
+	}
+
+	wantNames := []string{"first_tool", "second_tool", "third_tool"}
+	for i, wantName := range wantNames {
+		if name := gjson.Get(starts[i].Payload, "content_block.name").String(); name != wantName {
+			t.Fatalf("tool_use start %d name = %q, want %q (starts=%+v)", i, name, wantName, starts)
+		}
+		if blockIndex := gjson.Get(starts[i].Payload, "index").Int(); blockIndex != int64(i) {
+			t.Fatalf("tool_use start %d block index = %d, want %d", i, blockIndex, i)
 		}
 	}
+}
 
-	if !strings.Contains(gotArgs, `"command":"pwd"`) {
-		t.Fatalf("tool arguments = %q, want command pwd", gotArgs)
+func TestStreamingTool_LateIDAfterFinalization(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"name":"do_it"}}]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_late"}]}}]}`,
+	)
+
+	starts := toolUseStarts(events)
+	if len(starts) != 1 {
+		t.Fatalf("expected one belated tool_use start, got %d", len(starts))
 	}
-	if gotStopReason != "tool_use" {
-		t.Fatalf("stop_reason = %q, want tool_use", gotStopReason)
+
+	var sawMessageStop bool
+	for _, e := range events {
+		if e.Type == "message_stop" {
+			sawMessageStop = true
+			continue
+		}
+		if sawMessageStop {
+			switch e.Type {
+			case "content_block_start", "content_block_delta", "content_block_stop":
+				t.Fatalf("event %q emitted after message_stop (events=%+v)", e.Type, events)
+			}
+		}
+	}
+}
+
+func TestStreamingTool_StopReasonMixedSuppressedAndValid(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+			{"index":0,"id":"call_skip","function":{"name":"","arguments":""}},
+			{"index":1,"id":"call_real","function":{"name":"do_it","arguments":"{}"}}
+		]}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+	if got := lastStopReason(events); got != "tool_use" {
+		t.Fatalf("stop_reason = %q, want %q", got, "tool_use")
 	}
 }

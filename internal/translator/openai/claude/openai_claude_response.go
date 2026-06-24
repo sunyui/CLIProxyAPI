@@ -8,10 +8,11 @@ package claude
 import (
 	"bytes"
 	"context"
+	"sort"
 	"strings"
 
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -26,6 +27,9 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	Model       string
 	CreatedAt   int64
 	ToolNameMap map[string]string
+	// SawToolCall is true once at least one tool_use content_block_start has
+	// been emitted on the wire. Using raw upstream tool_calls presence here
+	// can produce stop_reason=tool_use with zero announced tool blocks.
 	SawToolCall bool
 	// Content accumulator for streaming
 	ContentAccumulator strings.Builder
@@ -57,10 +61,12 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 
 // ToolCallAccumulator holds the state for accumulating tool call data
 type ToolCallAccumulator struct {
-	ID                  string
-	Name                string
-	Arguments           strings.Builder
-	ContentBlockStarted bool
+	ID        string
+	Name      string
+	Arguments strings.Builder
+	// StartEmitted tracks whether content_block_start has already been sent
+	// for this tool index.
+	StartEmitted bool
 }
 
 // ConvertOpenAIResponseToClaude converts OpenAI streaming response format to Anthropic API format.
@@ -129,18 +135,43 @@ func effectiveOpenAIFinishReason(param *ConvertOpenAIResponseToAnthropicParams) 
 	return param.FinishReason
 }
 
-func sanitizeReadToolInputPages(toolName, argsJSON string) string {
-	if util.CanonicalToolName(toolName) != "read" || argsJSON == "" || !strings.Contains(argsJSON, "\"pages\"") || !gjson.Valid(argsJSON) {
+func sanitizeClaudeToolInput(toolName, argsJSON string) string {
+	if argsJSON == "" || !gjson.Valid(argsJSON) {
 		return argsJSON
 	}
-	pages := gjson.Get(argsJSON, "pages")
-	if !pages.Exists() {
+	switch util.CanonicalToolName(toolName) {
+	case "read":
+		return sanitizeReadToolInputPages(argsJSON)
+	case "enterworktree":
+		return sanitizeEnterWorktreeToolInput(argsJSON)
+	default:
 		return argsJSON
 	}
-	if pages.Type != gjson.Null && (pages.Type != gjson.String || pages.String() != "") {
+}
+
+func sanitizeReadToolInputPages(argsJSON string) string {
+	if !strings.Contains(argsJSON, `"pages"`) || !gjson.Get(argsJSON, "pages").Exists() {
+		return argsJSON
+	}
+	filePath := strings.ToLower(gjson.Get(argsJSON, "file_path").String())
+	if strings.HasSuffix(filePath, ".pdf") {
 		return argsJSON
 	}
 	cleaned, err := sjson.Delete(argsJSON, "pages")
+	if err != nil {
+		return argsJSON
+	}
+	return cleaned
+}
+
+func sanitizeEnterWorktreeToolInput(argsJSON string) string {
+	if !strings.Contains(argsJSON, `"path"`) || !strings.Contains(argsJSON, `"name"`) {
+		return argsJSON
+	}
+	if gjson.Get(argsJSON, "path").String() == "" || gjson.Get(argsJSON, "name").String() != "" {
+		return argsJSON
+	}
+	cleaned, err := sjson.Delete(argsJSON, "name")
 	if err != nil {
 		return argsJSON
 	}
@@ -237,9 +268,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			}
 
 			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
-				param.SawToolCall = true
 				index := int(toolCall.Get("index").Int())
-				blockIndex := param.toolContentBlockIndex(index)
 
 				// Initialize accumulator if needed
 				if _, exists := param.ToolCallsAccumulator[index]; !exists {
@@ -248,28 +277,25 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 				accumulator := param.ToolCallsAccumulator[index]
 
-				// Handle tool call ID
-				if id := toolCall.Get("id"); id.Exists() {
-					accumulator.ID = id.String()
+				// Handle tool call ID. Only accept JSON-string, non-empty
+				// values so malformed upstream fields do not overwrite a
+				// valid ID or coerce into a content_block.id.
+				if id := toolCall.Get("id"); id.Exists() && id.Type == gjson.String {
+					if idStr := id.String(); idStr != "" {
+						accumulator.ID = idStr
+					}
 				}
 
-				// Handle function name
+				// Handle function name and arguments
 				if function := toolCall.Get("function"); function.Exists() {
-					if name := function.Get("name"); name.Exists() && strings.TrimSpace(name.String()) != "" && !accumulator.ContentBlockStarted {
-						accumulator.Name = util.MapToolName(param.ToolNameMap, strings.TrimSpace(name.String()))
-
-						stopThinkingContentBlock(param, &results)
-
-						stopTextContentBlock(param, &results)
-
-						// Send content_block_start for tool_use
-						contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
-						contentBlockStartJSONBytes := []byte(contentBlockStartJSON)
-						contentBlockStartJSONBytes, _ = sjson.SetBytes(contentBlockStartJSONBytes, "index", blockIndex)
-						contentBlockStartJSONBytes, _ = sjson.SetBytes(contentBlockStartJSONBytes, "content_block.id", util.SanitizeClaudeToolID(accumulator.ID))
-						contentBlockStartJSONBytes, _ = sjson.SetBytes(contentBlockStartJSONBytes, "content_block.name", accumulator.Name)
-						results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_start", contentBlockStartJSONBytes, 2))
-						accumulator.ContentBlockStarted = true
+					// Only record the name until content_block_start has been
+					// emitted. Some upstreams send "name": "" or repeat the
+					// field across chunks; reassigning after start could drift
+					// from what was already announced.
+					if !accumulator.StartEmitted {
+						if name := function.Get("name"); name.Exists() && name.Type == gjson.String && name.String() != "" {
+							accumulator.Name = util.MapToolName(param.ToolNameMap, name.String())
+						}
 					}
 
 					// Handle function arguments
@@ -281,6 +307,13 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 					}
 				}
 
+				// Re-check on every chunk, not only chunks with a function
+				// object. Some upstreams split function.name and id across
+				// separate deltas.
+				if !accumulator.StartEmitted && accumulator.Name != "" && accumulator.ID != "" && !param.ContentBlocksStopped {
+					emitToolUseStart(param, index, accumulator, &results)
+				}
+
 				return true
 			})
 		}
@@ -289,9 +322,12 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 	// Handle finish_reason (but don't send message_delta/message_stop yet)
 	if finishReason := root.Get("choices.0.finish_reason"); finishReason.Exists() && finishReason.String() != "" {
 		reason := finishReason.String()
-		if param.SawToolCall {
+		switch {
+		case param.SawToolCall:
 			param.FinishReason = "tool_calls"
-		} else {
+		case reason == "tool_calls":
+			param.FinishReason = "stop"
+		default:
 			param.FinishReason = reason
 		}
 
@@ -309,10 +345,16 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 		// Send content_block_stop for any tool calls
 		if !param.ContentBlocksStopped {
-			for index := range param.ToolCallsAccumulator {
+			for _, index := range toolCallAccumulatorIndexes(param.ToolCallsAccumulator) {
 				accumulator := param.ToolCallsAccumulator[index]
-				if !accumulator.ContentBlockStarted {
-					continue
+				if !accumulator.StartEmitted {
+					// Belated emit for streams that supplied a valid name but
+					// never sent an id. SanitizeClaudeToolID("") produces the
+					// expected stable synthetic toolu_<nanos>_<n> ID shape.
+					if accumulator.Name == "" {
+						continue
+					}
+					emitToolUseStart(param, index, accumulator, &results)
 				}
 				blockIndex := param.toolContentBlockIndex(index)
 
@@ -320,8 +362,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				if accumulator.Arguments.Len() > 0 {
 					inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
 					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-					argsJSON := sanitizeReadToolInputPages(accumulator.Name, util.FixJSON(accumulator.Arguments.String()))
-					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", argsJSON)
+					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", sanitizeClaudeToolInput(accumulator.Name, util.FixJSON(accumulator.Arguments.String())))
 					results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
 				}
 
@@ -377,18 +418,22 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 	stopTextContentBlock(param, &results)
 
 	if !param.ContentBlocksStopped {
-		for index := range param.ToolCallsAccumulator {
+		for _, index := range toolCallAccumulatorIndexes(param.ToolCallsAccumulator) {
 			accumulator := param.ToolCallsAccumulator[index]
-			if !accumulator.ContentBlockStarted {
-				continue
+			if !accumulator.StartEmitted {
+				// Belated emit at [DONE]; same behavior as the finish_reason
+				// path for name-but-no-id streams.
+				if accumulator.Name == "" {
+					continue
+				}
+				emitToolUseStart(param, index, accumulator, &results)
 			}
 			blockIndex := param.toolContentBlockIndex(index)
 
 			if accumulator.Arguments.Len() > 0 {
 				inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
 				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-				argsJSON := sanitizeReadToolInputPages(accumulator.Name, util.FixJSON(accumulator.Arguments.String()))
-				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", argsJSON)
+				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", sanitizeClaudeToolInput(accumulator.Name, util.FixJSON(accumulator.Arguments.String())))
 				results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
 			}
 
@@ -450,7 +495,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
 				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolName)
 
-				argsStr := sanitizeReadToolInputPages(toolName, util.FixJSON(toolCall.Get("function.arguments").String()))
+				argsStr := sanitizeClaudeToolInput(toolName, util.FixJSON(toolCall.Get("function.arguments").String()))
 				if argsStr != "" && gjson.Valid(argsStr) {
 					argsJSON := gjson.Parse(argsStr)
 					if argsJSON.IsObject() {
@@ -576,6 +621,29 @@ func stopTextContentBlock(param *ConvertOpenAIResponseToAnthropicParams, results
 	param.TextContentBlockIndex = -1
 }
 
+func emitToolUseStart(param *ConvertOpenAIResponseToAnthropicParams, openAIToolIndex int, accumulator *ToolCallAccumulator, results *[][]byte) {
+	stopThinkingContentBlock(param, results)
+	stopTextContentBlock(param, results)
+
+	blockIndex := param.toolContentBlockIndex(openAIToolIndex)
+	contentBlockStartJSON := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`)
+	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "index", blockIndex)
+	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "content_block.id", util.SanitizeClaudeToolID(accumulator.ID))
+	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "content_block.name", accumulator.Name)
+	*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "content_block_start", contentBlockStartJSON, 2))
+	accumulator.StartEmitted = true
+	param.SawToolCall = true
+}
+
+func toolCallAccumulatorIndexes(accumulators map[int]*ToolCallAccumulator) []int {
+	indexes := make([]int, 0, len(accumulators))
+	for index := range accumulators {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	return indexes
+}
+
 // ConvertOpenAIResponseToClaudeNonStream converts a non-streaming OpenAI response to a non-streaming Anthropic response.
 //
 // Parameters:
@@ -649,7 +717,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 									toolUse, _ = sjson.SetBytes(toolUse, "id", util.SanitizeClaudeToolID(tc.Get("id").String()))
 									toolUse, _ = sjson.SetBytes(toolUse, "name", toolName)
 
-									argsStr := sanitizeReadToolInputPages(toolName, util.FixJSON(tc.Get("function.arguments").String()))
+									argsStr := sanitizeClaudeToolInput(toolName, util.FixJSON(tc.Get("function.arguments").String()))
 									if argsStr != "" && gjson.Valid(argsStr) {
 										argsJSON := gjson.Parse(argsStr)
 										if argsJSON.IsObject() {
@@ -707,7 +775,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
 					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolName)
 
-					argsStr := sanitizeReadToolInputPages(toolName, util.FixJSON(toolCall.Get("function.arguments").String()))
+					argsStr := sanitizeClaudeToolInput(toolName, util.FixJSON(toolCall.Get("function.arguments").String()))
 					if argsStr != "" && gjson.Valid(argsStr) {
 						argsJSON := gjson.Parse(argsStr)
 						if argsJSON.IsObject() {

@@ -12,6 +12,8 @@ logs/*
 conv/*
 temp/*
 refs/*
+plugins/*
+examples/plugin/bin/*
 
 # Storage backends
 pgstore/*
@@ -23,6 +25,7 @@ static/*
 
 # Authentication data
 auths/*
+/auths
 !auths/.gitkeep
 
 # Documentation
@@ -36,9 +39,11 @@ GEMINI.md
 .worktrees/
 .codex/*
 .claude/*
+.claude
 .gemini/*
 .serena/*
 .agent/*
+.agents
 .agents/*
 .opencode/*
 .idea/*
@@ -51,4 +56,15 @@ _bmad-output/*
 .DS_Store
 ._*
 
-dist/*
+# Go cache
+.gocache/
+
+# Python
+__pycache__/
+
+# Team distribution packaging scratch space
+/dist/package-work/
+
+# Team distribution docs are intentionally tracked on team-build
+!docs/installation.md
+!docs/team-config.yaml
