@@ -3,6 +3,7 @@ package claude
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -131,6 +132,44 @@ func TestConvertOpenAIResponseToClaude_StreamReadToolCallKeepsPDFPages(t *testin
 	if !foundPages {
 		t.Fatal("expected pages to be preserved for PDF Read input")
 	}
+}
+
+func TestConvertOpenAIResponseToClaudeNonStream_ReadPages(t *testing.T) {
+	tests := []struct {
+		name      string
+		filePath  string
+		wantPages bool
+	}{
+		{name: "non PDF removes pages", filePath: "/tmp/a.txt", wantPages: false},
+		{name: "PDF keeps pages", filePath: "/tmp/a.PDF", wantPages: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			arguments := `{"file_path":"` + tt.filePath + `","pages":"1","offset":2}`
+			response := `{"id":"chatcmpl","model":"m","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_read","type":"function","function":{"name":"Read","arguments":` + string(mustJSONQuote(t, arguments)) + `}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
+			out := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "", []byte(streamReq), nil, []byte(response), nil)
+			input := gjson.GetBytes(out, "content.0.input")
+			if got := input.Get("file_path").String(); got != tt.filePath {
+				t.Fatalf("file_path = %q, want %q; output=%s", got, tt.filePath, out)
+			}
+			if got := input.Get("offset").Int(); got != 2 {
+				t.Fatalf("offset = %d, want 2; output=%s", got, out)
+			}
+			if got := input.Get("pages").Exists(); got != tt.wantPages {
+				t.Fatalf("pages exists = %v, want %v; output=%s", got, tt.wantPages, out)
+			}
+		})
+	}
+}
+
+func mustJSONQuote(t *testing.T, value string) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func TestConvertOpenAIResponseToClaudeNonStream_EnterWorktreeDropsEmptyNameWithPath(t *testing.T) {

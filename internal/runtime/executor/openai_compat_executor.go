@@ -393,6 +393,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		var streamUsage helps.StreamUsageBuffer
 		readStart := time.Now()
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -401,9 +402,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				helps.LogWithRequestID(ctx).Infof("openai compat stream slow upstream read: wait=%s bytes=%d", readWait.Round(time.Millisecond), len(line))
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+			streamUsage.Observe(helps.ParseOpenAIStreamUsage(line))
 			streamLine := trimOpenAICompatStreamLine(line)
 			if len(streamLine) == 0 {
 				readStart = time.Now()
@@ -470,7 +469,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				}
 			}
 		}
-		// Ensure we record the request if no usage chunk was ever seen
+		// Ensure we record the request if no usage chunk was ever seen.
+		streamUsage.Publish(ctx, reporter)
 		reporter.EnsurePublished(ctx)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
