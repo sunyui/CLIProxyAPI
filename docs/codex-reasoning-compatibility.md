@@ -2,9 +2,12 @@
 
 ## Display sentinel filtering
 
-Some Codex-compatible models include the exact empty HTML comment `<!-- -->` in `response.reasoning_summary_text.delta`. It is provider display metadata rather than reasoning content. The Codex-to-Claude streaming translator removes only that exact marker before emitting Claude `thinking_delta` events.
+Some Codex-compatible models include the exact empty HTML comment `<!-- -->` in reasoning output. It is provider display metadata rather than reasoning content. Both supported Claude response paths remove only that exact marker:
 
-The filter is streaming-safe when the marker spans multiple upstream deltas. Similar comments, incomplete marker prefixes at the end of a reasoning block, final text, and tool payloads are preserved. Empty deltas are not emitted after filtering, and pending non-marker content is flushed before the thinking signature and block stop.
+- Codex Responses `response.reasoning_summary_text.delta` translated by the Codex-to-Claude translator.
+- OpenAI-compatible `reasoning_content` translated by the OpenAI-to-Claude translator.
+
+Both streaming filters handle markers split across upstream deltas. Similar comments, incomplete marker prefixes at the end of a reasoning block, final text, and tool payloads are preserved. Empty deltas are not emitted after filtering, and pending non-marker content is flushed before the block stops. The Codex path also flushes pending content before a thinking signature.
 
 ## Preserved team compatibility
 
@@ -23,6 +26,7 @@ Run the focused translator regression suite:
 
 ```bash
 go test ./internal/translator/codex/claude -run 'Sentinel|ReasoningSummaryMarker|Thinking|FunctionCall' -count=1
+go test ./internal/translator/openai/claude -run 'ReasoningDisplaySentinel' -count=1
 ```
 
 The full repository verification remains:

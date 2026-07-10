@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -103,6 +104,64 @@ func lastStopReason(events []sseEvent) string {
 }
 
 const streamReq = `{"stream":true}`
+
+func TestConvertOpenAIResponseToClaude_StreamReasoningDisplaySentinel(t *testing.T) {
+	const marker = "<!-- -->"
+	type testCase struct {
+		name   string
+		chunks []string
+		want   string
+	}
+
+	tests := []testCase{
+		{name: "complete markers", chunks: []string{"alpha" + marker + "omega" + marker}, want: "alphaomega"},
+		{name: "marker only", chunks: []string{marker}, want: ""},
+		{name: "similar comments", chunks: []string{"<!--x--><!--  -->"}, want: "<!--x--><!--  -->"},
+		{name: "incomplete prefix", chunks: []string{"text<!--"}, want: "text<!--"},
+	}
+	for split := 1; split < len(marker); split++ {
+		tests = append(tests, testCase{
+			name:   fmt.Sprintf("split marker at %d", split),
+			chunks: []string{"before" + marker[:split], marker[split:] + "after"},
+			want:   "beforeafter",
+		})
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			streamChunks := make([]string, 0, len(tt.chunks)+1)
+			for _, reasoning := range tt.chunks {
+				streamChunks = append(streamChunks, `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"reasoning_content":`+string(mustJSONQuote(t, reasoning))+`}}]}`)
+			}
+			streamChunks = append(streamChunks, `{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+			events := runStream(t, streamReq, streamChunks...)
+
+			var got strings.Builder
+			for _, event := range events {
+				if event.Type != "content_block_delta" || gjson.Get(event.Payload, "delta.type").String() != "thinking_delta" {
+					continue
+				}
+				thinking := gjson.Get(event.Payload, "delta.thinking").String()
+				if thinking == "" {
+					t.Fatalf("unexpected empty thinking delta: %s", event.Payload)
+				}
+				got.WriteString(thinking)
+			}
+			if got.String() != tt.want {
+				t.Fatalf("thinking = %q, want %q", got.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestConvertOpenAIResponseToClaude_NonStreamReasoningDisplaySentinel(t *testing.T) {
+	response := `{"id":"c1","model":"m","choices":[{"message":{"reasoning_content":"alpha<!-- -->omega<!--x-->"},"finish_reason":"stop"}]}`
+
+	got := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "", nil, nil, []byte(response), nil)
+	if thinking := gjson.GetBytes(got, "content.0.thinking").String(); thinking != "alphaomega<!--x-->" {
+		t.Fatalf("thinking = %q, want %q", thinking, "alphaomega<!--x-->")
+	}
+}
 
 func TestConvertOpenAIResponseToClaude_StreamReadToolCallSanitizesPages(t *testing.T) {
 	events := runStream(t, streamReq,

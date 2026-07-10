@@ -21,6 +21,8 @@ var (
 	dataTag = []byte("data:")
 )
 
+const openAIReasoningDisplaySentinel = "<!-- -->"
+
 // ConvertOpenAIResponseToAnthropicParams holds parameters for response conversion
 type ConvertOpenAIResponseToAnthropicParams struct {
 	MessageID   string
@@ -39,6 +41,8 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	TextContentBlockStarted bool
 	// Track if thinking content block has been started
 	ThinkingContentBlockStarted bool
+	// Hold a possible split display sentinel between reasoning chunks.
+	ThinkingDisplayPending string
 	// Track finish reason for later use
 	FinishReason string
 	// Track if content blocks have been stopped
@@ -211,6 +215,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 		// Handle reasoning content delta
 		if reasoning := delta.Get("reasoning_content"); reasoning.Exists() {
 			for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
+				reasoningText = sanitizeOpenAIReasoningDisplayDelta(param, reasoningText)
 				if reasoningText == "" {
 					continue
 				}
@@ -227,11 +232,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 					param.ThinkingContentBlockStarted = true
 				}
 
-				thinkingDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
-				thinkingDeltaJSONBytes := []byte(thinkingDeltaJSON)
-				thinkingDeltaJSONBytes, _ = sjson.SetBytes(thinkingDeltaJSONBytes, "index", param.ThinkingContentBlockIndex)
-				thinkingDeltaJSONBytes, _ = sjson.SetBytes(thinkingDeltaJSONBytes, "delta.thinking", reasoningText)
-				results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", thinkingDeltaJSONBytes, 2))
+				emitOpenAIThinkingDelta(param, reasoningText, &results)
 			}
 		}
 
@@ -332,13 +333,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 		}
 
 		// Send content_block_stop for thinking content if needed
-		if param.ThinkingContentBlockStarted {
-			contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
-			contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", param.ThinkingContentBlockIndex)
-			results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStopJSON, 2))
-			param.ThinkingContentBlockStarted = false
-			param.ThinkingContentBlockIndex = -1
-		}
+		stopThinkingContentBlock(param, &results)
 
 		// Send content_block_stop for text if text content block was started
 		stopTextContentBlock(param, &results)
@@ -407,14 +402,7 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 	var results [][]byte
 
 	// Ensure all content blocks are stopped before final events
-	if param.ThinkingContentBlockStarted {
-		contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
-		contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", param.ThinkingContentBlockIndex)
-		results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStopJSON, 2))
-		param.ThinkingContentBlockStarted = false
-		param.ThinkingContentBlockIndex = -1
-	}
-
+	stopThinkingContentBlock(param, &results)
 	stopTextContentBlock(param, &results)
 
 	if !param.ContentBlocksStopped {
@@ -472,6 +460,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 
 		reasoningNode := choice.Get("message.reasoning_content")
 		for _, reasoningText := range collectOpenAIReasoningTexts(reasoningNode) {
+			reasoningText = strings.ReplaceAll(reasoningText, openAIReasoningDisplaySentinel, "")
 			if reasoningText == "" {
 				continue
 			}
@@ -591,9 +580,40 @@ func collectOpenAIReasoningTexts(node gjson.Result) []string {
 	return texts
 }
 
+func sanitizeOpenAIReasoningDisplayDelta(param *ConvertOpenAIResponseToAnthropicParams, delta string) string {
+	combined := param.ThinkingDisplayPending + delta
+	combined = strings.ReplaceAll(combined, openAIReasoningDisplaySentinel, "")
+
+	pendingLength := 0
+	maxPending := min(len(combined), len(openAIReasoningDisplaySentinel)-1)
+	for length := maxPending; length > 0; length-- {
+		if strings.HasSuffix(combined, openAIReasoningDisplaySentinel[:length]) {
+			pendingLength = length
+			break
+		}
+	}
+
+	param.ThinkingDisplayPending = strings.Clone(combined[len(combined)-pendingLength:])
+	return combined[:len(combined)-pendingLength]
+}
+
+func emitOpenAIThinkingDelta(param *ConvertOpenAIResponseToAnthropicParams, thinking string, results *[][]byte) {
+	if thinking == "" {
+		return
+	}
+	thinkingDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
+	thinkingDeltaJSON, _ = sjson.SetBytes(thinkingDeltaJSON, "index", param.ThinkingContentBlockIndex)
+	thinkingDeltaJSON, _ = sjson.SetBytes(thinkingDeltaJSON, "delta.thinking", thinking)
+	*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", thinkingDeltaJSON, 2))
+}
+
 func stopThinkingContentBlock(param *ConvertOpenAIResponseToAnthropicParams, results *[][]byte) {
 	if !param.ThinkingContentBlockStarted {
 		return
+	}
+	if param.ThinkingDisplayPending != "" {
+		emitOpenAIThinkingDelta(param, param.ThinkingDisplayPending, results)
+		param.ThinkingDisplayPending = ""
 	}
 	contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
 	contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", param.ThinkingContentBlockIndex)
@@ -758,6 +778,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 
 			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
 				for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
+					reasoningText = strings.ReplaceAll(reasoningText, openAIReasoningDisplaySentinel, "")
 					if reasoningText == "" {
 						continue
 					}
